@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Bybit Token Filter</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#050816" />
+  <style>
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #050816;
+      color: #f5f5f5;
+    }
+    header {
+      padding: 12px 16px;
+      background: #0b1020;
+      border-bottom: 1px solid #222;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    h1 {
+      margin: 0;
+      font-size: 18px;
+    }
+    .sub {
+      font-size: 12px;
+      color: #aaa;
+    }
+    .controls {
+      padding: 8px 16px;
+      background: #050816;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      border-bottom: 1px solid #111;
+    }
+    .controls select, .controls input {
+      background: #0b1020;
+      color: #f5f5f5;
+      border: 1px solid #333;
+      border-radius: 4px;
+      padding: 4px 8px;
+      font-size: 12px;
+    }
+    .controls button {
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      padding: 6px 10px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .controls button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    thead {
+      background: #0b1020;
+      position: sticky;
+      top: 72px;
+      z-index: 5;
+    }
+    th, td {
+      padding: 6px 8px;
+      border-bottom: 1px solid #111;
+      text-align: right;
+      white-space: nowrap;
+    }
+    th:first-child, td:first-child {
+      text-align: left;
+    }
+    tr:nth-child(even) {
+      background: #070b18;
+    }
+    .pos {
+      color: #4ade80;
+    }
+    .neg {
+      color: #f97373;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+      background: #111827;
+      color: #e5e7eb;
+    }
+    .status {
+      padding: 4px 16px 8px;
+      font-size: 11px;
+      color: #9ca3af;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Bybit Token Filter</h1>
+    <div class="sub">Фильтр по изменению цены · сортировка по капитализации</div>
+  </header>
+
+  <div class="controls">
+    <label>
+      Период:
+      <select id="periodSelect">
+        <option value="1h">1 час</option>
+        <option value="4h">4 часа</option>
+        <option value="16h">16 часов</option>
+        <option value="24h">24 часа</option>
+        <option value="48h">48 часов</option>
+        <option value="72h">72 часа</option>
+        <option value="168h">7 дней</option>
+      </select>
+    </label>
+    <label>
+      Мин. изменение (%):
+      <input id="minChange" type="number" step="0.1" value="-100" />
+    </label>
+    <label>
+      Макс. изменение (%):
+      <input id="maxChange" type="number" step="0.1" value="100" />
+    </label>
+    <button id="refreshBtn">Обновить</button>
+  </div>
+
+  <div class="status" id="status">Загрузка данных…</div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Токен</th>
+        <th>Капа (ранг)</th>
+        <th>Цена</th>
+        <th>1ч %</th>
+        <th>4ч %</th>
+        <th>16ч %</th>
+        <th>24ч %</th>
+        <th>48ч %</th>
+        <th>72ч %</th>
+        <th>7д %</th>
+      </tr>
+    </thead>
+    <tbody id="tableBody">
+    </tbody>
+  </table>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const tbody = document.getElementById('tableBody');
+    const periodSelect = document.getElementById('periodSelect');
+    const minChangeInput = document.getElementById('minChange');
+    const maxChangeInput = document.getElementById('maxChange');
+    const refreshBtn = document.getElementById('refreshBtn');
+
+    const BYBIT_BASE = 'https://api.bybit.com';
+    const COINGECKO_BASE = 'https://api.coingecko.com/api/v3';
+
+    // Соответствие периодов в часах → интервал Bybit (в минутах)
+    const PERIODS = {
+      '1h': '60',
+      '4h': '240',
+      '16h': '960',
+      '24h': '1440',
+      '48h': '2880',
+      '72h': '4320',
+      '168h': '10080'
+    };
+
+    let globalData = []; // сюда сложим все токены с изменениями и капой
+
+    async function fetchJson(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }
+
+    async function fetchBybitTickers() {
+      // Все спотовые пары USDT
+      const url = `${BYBIT_BASE}/v5/market/tickers?category=spot`;
+      const data = await fetchJson(url);
+      return (data.result.list || []).filter(t => t.symbol.endsWith('USDT'));
+    }
+
+    async function fetchKline(symbol, interval) {
+      const url = `${BYBIT_BASE}/v5/market/kline?category=spot&symbol=${symbol}&interval=${interval}&limit=2`;
+      const data = await fetchJson(url);
+      return data.result.list || [];
+    }
+
+    async function fetchCoinGeckoMarketCaps() {
+      // Берём топ по капе (до 250 монет) — этого достаточно для сортировки по значимости
+      const url = `${COINGECKO_BASE}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1&sparkline=false`;
+      const data = await fetchJson(url);
+      const map = {};
+      data.forEach((c, idx) => {
+        if (c.symbol) {
+          map[c.symbol.toUpperCase()] = {
+            rank: idx + 1,
+            market_cap: c.market_cap || 0
+          };
+        }
+      });
+      return map;
+    }
+
+    function calcChangeFromKlines(klines) {
+      if (!klines || klines.length < 2) return null;
+      const first = klines[0];
+      const last = klines[klines.length - 1];
+      const open = parseFloat(first[1]);
+      const close = parseFloat(last[4]);
+      if (!open || !close) return null;
+      return ((close - open) / open) * 100;
+    }
+
+    async function buildData() {
+      statusEl.textContent = 'Загрузка тикеров Bybit…';
+      const tickers = await fetchBybitTickers();
+
+      statusEl.textContent = 'Загрузка капитализации (CoinGecko)…';
+      const capMap = await fetchCoinGeckoMarketCaps();
+
+      const symbols = tickers.map(t => t.symbol);
+      const result = [];
+
+      // Чтобы не убить API, делаем последовательные запросы (медленнее, но безопаснее)
+      for (let i = 0; i < symbols.length; i++) {
+        const symbol = symbols[i];
+        const base = symbol.replace('USDT', '');
+        const ticker = tickers.find(t => t.symbol === symbol);
+        const price = parseFloat(ticker.lastPrice);
+
+        const cg = capMap[base.toUpperCase()] || { rank: 9999, market_cap: 0 };
+
+        const changes = {};
+
+        for (const [key, interval] of Object.entries(PERIODS)) {
+          try {
+            const kl = await fetchKline(symbol, interval);
+            changes[key] = calcChangeFromKlines(kl);
+          } catch (e) {
+            changes[key] = null;
+          }
+        }
+
+        result.push({
+          symbol,
+          base,
+          price,
+          rank: cg.rank,
+          market_cap: cg.market_cap,
+          changes
+        });
+
+        statusEl.textContent = `Обработка ${i + 1}/${symbols.length}…`;
+      }
+
+      // сортировка по значимости: по рангу капы (меньше = важнее)
+      result.sort((a, b) => a.rank - b.rank);
+      globalData = result;
+      statusEl.textContent = `Готово. Найдено токенов: ${globalData.length}`;
+    }
+
+    function formatPct(v) {
+      if (v === null || v === undefined || isNaN(v)) return '-';
+      const cls = v > 0 ? 'pos' : (v < 0 ? 'neg' : '');
+      return `<span class="${cls}">${v.toFixed(2)}%</span>`;
+    }
+
+    function renderTable() {
+      const period = periodSelect.value;
+      const minChange = parseFloat(minChangeInput.value);
+      const maxChange = parseFloat(maxChangeInput.value);
+
+      const rows = [];
+
+      globalData.forEach((t) => {
+        const c1h   = t.changes['1h'];
+        const c4h   = t.changes['4h'];
+        const c16h  = t.changes['16h'];
+        const c24h  = t.changes['24h'];
+        const c48h  = t.changes['48h'];
+        const c72h  = t.changes['72h'];
+        const c168h = t.changes['168h'];
+
+        const current = t.changes[period];
+        if (current === null || isNaN(current)) return;
+
+        if (!isNaN(minChange) && current < minChange) return;
+        if (!isNaN(maxChange) && current > maxChange) return;
+
+        rows.push(`
+          <tr>
+            <td><span class="badge">${t.base}</span></td>
+            <td>#${t.rank}</td>
+            <td>${t.price ? t.price.toFixed(6) : '-'}</td>
+            <td>${formatPct(c1h)}</td>
+            <td>${formatPct(c4h)}</td>
+            <td>${formatPct(c16h)}</td>
+            <td>${formatPct(c24h)}</td>
+            <td>${formatPct(c48h)}</td>
+            <td>${formatPct(c72h)}</td>
+            <td>${formatPct(c168h)}</td>
+          </tr>
+        `);
+      });
+
+      tbody.innerHTML = rows.join('') || `<tr><td colspan="10">Нет токенов под текущие фильтры</td></tr>`;
+    }
+
+    async function init() {
+      refreshBtn.disabled = true;
+      try {
+        await buildData();
+        renderTable();
+      } catch (e) {
+        console.error(e);
+        statusEl.textContent = 'Ошибка загрузки данных. Попробуй обновить позже.';
+      } finally {
+        refreshBtn.disabled = false;
+      }
+    }
+
+    refreshBtn.addEventListener('click', async () => {
+      await init();
+    });
+
+    periodSelect.addEventListener('change', renderTable);
+    minChangeInput.addEventListener('input', renderTable);
+    maxChangeInput.addEventListener('input', renderTable);
+
+    // старт
+    init();
+  </script>
+</body>
+</html>
